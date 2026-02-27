@@ -1,0 +1,13 @@
+FROM quay.io/skopeo/stable:latest
+
+# Outils nécessaires pour le traitement des tarballs RKE2
+RUN dnf install -y \
+      wget \
+      zstd \
+      jq \
+      tar \
+    && dnf clean all
+
+# Injection du CA certificat dans le trust store Fedora
+COPY ca.crt /etc/pki/ca-trust/source/anchors/custom-ca.crt
+RUN update-ca-trust extract
