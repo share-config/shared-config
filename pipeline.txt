@@ -1,3 +1,103 @@
+# ---------------------------------------------------------------
+# Pipeline : RKE2 Image Sync + Verify
+# Project  : rke2-artefacts
+# Trigger  : Manuel — Run Pipeline → saisir RKE2_VERSION
+# ---------------------------------------------------------------
+
+variables:
+  RKE2_VERSION: "v1.32.1+rke2r1"                                    # override at runtime
+  SKOPEO_IMAGE: "registry.gitlab.com/<group>/skopeo-custom:latest"  # ← à remplacer
+
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "web"'
+
+stages:
+  - sync
+  - verify
+
+# ---------------------------------------------------------------
+# STAGE 1 — Téléchargement + Push des images
+# ---------------------------------------------------------------
+sync-rke2-images:
+  stage: sync
+  image: $SKOPEO_IMAGE
+  script:
+    - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - |
+      set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+
+      push_tarball() {
+        local ZST="$1"
+        local TAR="${ZST%.zst}"
+
+        echo ""
+        echo ">>> ${ZST}"
+
+        echo "[1/3] Downloading..."
+        wget -q --show-progress -O "${ZST}" "${BASE_URL}/${ZST}"
+
+        echo "[2/3] Decompressing..."
+        zstd -d "${ZST}" -o "${TAR}" && rm -f "${ZST}"
+
+        echo "[3/3] Pushing images..."
+        tar -xOf "${TAR}" manifest.json \
+          | jq -r '.[].RepoTags[] | select(. != null)' \
+          | while read -r IMAGE; do
+              TARGET="${CI_REGISTRY_IMAGE}/rke2/$(echo "$IMAGE" | sed 's|.*/||')"
+              echo "    ${IMAGE} -> ${TARGET}"
+              skopeo copy "docker-archive:${TAR}:${IMAGE}" "docker://${TARGET}"
+              echo "${TARGET}" >> pushed-images.txt
+            done
+
+        rm -f "${TAR}"
+      }
+
+      push_tarball "rke2-images-core.linux-amd64.tar.zst"
+      push_tarball "rke2-images-calico.linux-amd64.tar.zst"
+
+  artifacts:
+    paths:
+      - pushed-images.txt    # transmis au stage verify
+    expire_in: 1 day
+
+# ---------------------------------------------------------------
+# STAGE 2 — Vérification des images poussées
+# ---------------------------------------------------------------
+verify-rke2-images:
+  stage: verify
+  image: $SKOPEO_IMAGE
+  needs:
+    - job: sync-rke2-images
+      artifacts: true
+  script:
+    - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - |
+      set -e
+      TOTAL=0
+      FAILED=0
+
+      echo "Images poussées durant ce run :"
+      echo "================================"
+      cat pushed-images.txt
+      echo "================================"
+      echo ""
+
+      while read -r IMAGE; do
+        TOTAL=$((TOTAL + 1))
+        DIGEST=$(skopeo inspect --format "{{.Digest}}" "docker://${IMAGE}" 2>/dev/null)
+        if [ -n "$DIGEST" ]; then
+          echo "  ✓  ${IMAGE}"
+          echo "     ${DIGEST}"
+        else
+          echo "  ✗  ${IMAGE} — INACCESSIBLE"
+          FAILED=$((FAILED + 1))
+        fi
+      done < pushed-images.txt
+
+      echo ""
+      echo "Résultat : $((TOTAL - FAILED))/${TOTAL} images vérifiées"
+
+      [ $FAILED -eq 0 ] || exit 1
