@@ -70,16 +70,24 @@ CMD ["--help"]
 
 
 
-copy-image:
-  image: registry.exemple.com/outils/skopeo-custom:latest
+
+
+stages:
+  - build
+
+build-skopeo-image:
+  stage: build
+  image: quay.io/buildah/stable:latest
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE:latest
+    STORAGE_DRIVER: vfs        # pas besoin de privileged, fonctionne rootless
+    BUILDAH_FORMAT: docker     # image compatible Docker
+  before_script:
+    - cp "$REGISTRY_CA_CERT" /etc/pki/ca-trust/source/anchors/registry-ca.crt
+    - update-ca-trust extract
+    - buildah login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
-    - skopeo copy
-        --src-creds "$SRC_USER:$SRC_PASSWORD"
-        --dest-creds "$DEST_USER:$DEST_PASSWORD"
-        docker://source-registry.local/image:$CI_COMMIT_SHA
-        docker://dest-registry.io/image:$CI_COMMIT_SHA
-
-
-
-
-
+    - buildah build -t "$IMAGE" .
+    - buildah push "$IMAGE"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
