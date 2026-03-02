@@ -1,0 +1,5 @@
+FROM python:3.12-alpine
+RUN apk add --no-cache openssh-client sshpass git wget ca-certificates && \
+    pip install --no-cache-dir ansible
+COPY ca.crt /usr/local/share/ca-certificates/custom-ca.crt
+RUN update-ca-certificates
