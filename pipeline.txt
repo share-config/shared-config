@@ -11,12 +11,12 @@ variables:
 stages:
   - sync
   - verify
-
 # ---------------------------------------------------------------
-# STAGE 1 — Téléchargement + Push des images
+# STAGE sync — Job 1 : Push des images vers le Container Registry
 # ---------------------------------------------------------------
 sync-rke2-images:
   stage: sync
+  when: manual
   image: $SKOPEO_IMAGE
   script:
     - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
@@ -31,7 +31,6 @@ sync-rke2-images:
 
         echo ""
         echo ">>> ${ZST}"
-
         echo "[1/3] Downloading..."
         wget -q --show-progress -O "${ZST}" "${BASE_URL}/${ZST}"
 
@@ -60,10 +59,47 @@ sync-rke2-images:
     expire_in: 1 day
 
 # ---------------------------------------------------------------
-# STAGE 2 — Vérification contre les .txt officiels GitHub
+# STAGE sync — Job 2 : Binaires vers le Package Registry
+# ---------------------------------------------------------------
+download-rke2-binaries:
+  stage: sync
+  when: manual
+  image: $SKOPEO_IMAGE
+  script:
+    - |
+      set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+      PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rke2/${RKE2_VERSION}"
+
+      echo "==> Downloading..."
+      wget -q --show-progress -O "rke2.linux-amd64"                "${BASE_URL}/rke2.linux-amd64"
+      wget -q --show-progress -O "rke2-images.linux-amd64.tar.zst" "${BASE_URL}/rke2-images.linux-amd64.tar.zst"
+      wget -q --show-progress -O "sha256sum-amd64.txt"             "${BASE_URL}/sha256sum-amd64.txt"
+
+      echo "==> Verifying checksums..."
+      sha256sum -c sha256sum-amd64.txt --ignore-missing
+      echo "  ✓ Checksums OK"
+
+      echo "==> Publishing to Package Registry..."
+      for FILE in "rke2.linux-amd64" "rke2-images.linux-amd64.tar.zst" "sha256sum-amd64.txt"; do
+        echo "  Uploading ${FILE}..."
+        wget -q \
+          --method=PUT \
+          --header="JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --body-file="${FILE}" \
+          "${PKG_URL}/${FILE}"
+        echo "  ✓ ${FILE}"
+      done
+
+      echo "Disponible sur : ${CI_PROJECT_URL}/-/packages"
+
+# ---------------------------------------------------------------
+# STAGE verify — Vérification contre les .txt officiels GitHub
 # ---------------------------------------------------------------
 verify-rke2-images:
   stage: verify
+  when: manual
   image: $SKOPEO_IMAGE
   needs:
     - job: sync-rke2-images
@@ -75,7 +111,6 @@ verify-rke2-images:
       VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
       BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
 
-      # --- Télécharger les listes officielles (source de vérité) ------
       echo "==> Téléchargement des listes de référence GitHub..."
       wget -q -O core.txt   "${BASE_URL}/rke2-images-core.linux-amd64.txt"
       wget -q -O calico.txt "${BASE_URL}/rke2-images-calico.linux-amd64.txt"
@@ -85,14 +120,11 @@ verify-rke2-images:
       PUSHED=$(wc -l < pushed-images.txt | tr -d ' ')
 
       echo ""
-      echo "Attendu  (GitHub .txt)  : ${EXPECTED} images"
-      echo "Poussé   (sync stage)   : ${PUSHED} images"
+      echo "Attendu  (GitHub .txt) : ${EXPECTED} images"
+      echo "Poussé   (sync stage)  : ${PUSHED} images"
       echo ""
 
-      # --- Vérifier chaque image attendue dans le registry ------------
       echo "==> Vérification dans le registry..."
-      echo ""
-
       TOTAL=0
       FAILED=0
 
@@ -106,12 +138,11 @@ verify-rke2-images:
           echo "  ✓  ${SHORT}"
           echo "     ${DIGEST}"
         else
-          echo "  ✗  ${SHORT}  ← MANQUANT dans le registry"
+          echo "  ✗  ${SHORT}  ← MANQUANT"
           FAILED=$((FAILED + 1))
         fi
       done < expected.txt
 
-      # --- Résumé final -----------------------------------------------
       echo ""
       echo "======================================="
       echo "  Attendu  : ${EXPECTED}"
