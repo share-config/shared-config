@@ -1,0 +1,15 @@
+install-ca:
+  stage: bootstrap
+  image: $ANSIBLE_IMAGE
+  when: manual
+  before_script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$ANSIBLE_SSH_PRIVATE_KEY" ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    - |
+      ansible-playbook playbooks/install-ca.yml \
+        -i inventory/cluster/ \
+        -u root \
+        -e "ca_cert_path=${REGISTRY_CA_CERT}"
+    - echo "✓ CA installé sur tous les nœuds"

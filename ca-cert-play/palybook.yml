@@ -1,0 +1,29 @@
+---
+# Install CA certificate on all RKE2 nodes
+# Variable requise : REGISTRY_CA_CERT (path vers le fichier CA, injecté par GitLab CI)
+
+- name: Install CA certificate on RKE2 nodes
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Copy CA certificate to trust store
+      ansible.builtin.copy:
+        src: "{{ ca_cert_path }}"
+        dest: "/etc/pki/ca-trust/source/anchors/gitlab-registry-ca.crt"
+        owner: root
+        group: root
+        mode: "0644"
+      register: ca_copied
+
+    - name: Update CA trust store (RedHat/Rocky)
+      ansible.builtin.command: update-ca-trust extract
+      when:
+        - ca_copied.changed
+        - ansible_os_family == "RedHat"
+
+    - name: Update CA trust store (Debian/Ubuntu)
+      ansible.builtin.command: update-ca-certificates
+      when:
+        - ca_copied.changed
+        - ansible_os_family == "Debian"
