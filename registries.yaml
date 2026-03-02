@@ -1,0 +1,7 @@
+configs:
+  "${CI_REGISTRY}":
+    auth:
+      username: "${REGISTRY_DEPLOY_USERNAME}"
+      password: "${REGISTRY_DEPLOY_PASSWORD}"
+    tls:
+      insecure_skip_verify: false
