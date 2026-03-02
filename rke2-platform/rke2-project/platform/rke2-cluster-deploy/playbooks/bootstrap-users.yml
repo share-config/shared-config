@@ -43,3 +43,13 @@
         state: present
         key: "{{ ssh_public_key }}"
       # Idempotent : skips si la clé est déjà présente
+
+
+- name: "Copy SSH public key to {{ deploy_user }} authorized_keys"
+  ansible.builtin.shell: |
+    ssh -i ~/.ssh/id_rsa \
+        -o StrictHostKeyChecking=no \
+        root@{{ ansible_host }} \
+        "cat >> /home/{{ deploy_user }}/.ssh/authorized_keys" \
+        < ~/.ssh/id_rsa.pub
+  delegate_to: localhost
