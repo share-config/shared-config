@@ -5,12 +5,8 @@
 # ---------------------------------------------------------------
 
 variables:
-  RKE2_VERSION: "v1.32.1+rke2r1"                                    # override at runtime
-  SKOPEO_IMAGE: "registry.gitlab.com/<group>/skopeo-custom:latest"  # ← à remplacer
-
-workflow:
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+  RKE2_VERSION: "v1.32.1+rke2r1"
+  SKOPEO_IMAGE: "registry.gitlab.com/<group>/skopeo-custom:latest"
 
 stages:
   - sync
@@ -60,11 +56,11 @@ sync-rke2-images:
 
   artifacts:
     paths:
-      - pushed-images.txt    # transmis au stage verify
+      - pushed-images.txt
     expire_in: 1 day
 
 # ---------------------------------------------------------------
-# STAGE 2 — Vérification des images poussées
+# STAGE 2 — Vérification contre les .txt officiels GitHub
 # ---------------------------------------------------------------
 verify-rke2-images:
   stage: verify
@@ -76,28 +72,51 @@ verify-rke2-images:
     - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
     - |
       set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+
+      # --- Télécharger les listes officielles (source de vérité) ------
+      echo "==> Téléchargement des listes de référence GitHub..."
+      wget -q -O core.txt   "${BASE_URL}/rke2-images-core.linux-amd64.txt"
+      wget -q -O calico.txt "${BASE_URL}/rke2-images-calico.linux-amd64.txt"
+      cat core.txt calico.txt > expected.txt
+
+      EXPECTED=$(wc -l < expected.txt | tr -d ' ')
+      PUSHED=$(wc -l < pushed-images.txt | tr -d ' ')
+
+      echo ""
+      echo "Attendu  (GitHub .txt)  : ${EXPECTED} images"
+      echo "Poussé   (sync stage)   : ${PUSHED} images"
+      echo ""
+
+      # --- Vérifier chaque image attendue dans le registry ------------
+      echo "==> Vérification dans le registry..."
+      echo ""
+
       TOTAL=0
       FAILED=0
 
-      echo "Images poussées durant ce run :"
-      echo "================================"
-      cat pushed-images.txt
-      echo "================================"
-      echo ""
-
-      while read -r IMAGE; do
+      while read -r SOURCE_IMAGE; do
+        SHORT=$(echo "$SOURCE_IMAGE" | sed 's|.*/||')
+        TARGET="${CI_REGISTRY_IMAGE}/rke2/${SHORT}"
         TOTAL=$((TOTAL + 1))
-        DIGEST=$(skopeo inspect --format "{{.Digest}}" "docker://${IMAGE}" 2>/dev/null)
+
+        DIGEST=$(skopeo inspect --format "{{.Digest}}" "docker://${TARGET}" 2>/dev/null)
         if [ -n "$DIGEST" ]; then
-          echo "  ✓  ${IMAGE}"
+          echo "  ✓  ${SHORT}"
           echo "     ${DIGEST}"
         else
-          echo "  ✗  ${IMAGE} — INACCESSIBLE"
+          echo "  ✗  ${SHORT}  ← MANQUANT dans le registry"
           FAILED=$((FAILED + 1))
         fi
-      done < pushed-images.txt
+      done < expected.txt
 
+      # --- Résumé final -----------------------------------------------
       echo ""
-      echo "Résultat : $((TOTAL - FAILED))/${TOTAL} images vérifiées"
+      echo "======================================="
+      echo "  Attendu  : ${EXPECTED}"
+      echo "  Vérifié  : $((TOTAL - FAILED))"
+      echo "  Manquant : ${FAILED}"
+      echo "======================================="
 
       [ $FAILED -eq 0 ] || exit 1
