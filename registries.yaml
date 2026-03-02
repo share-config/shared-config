@@ -5,3 +5,40 @@ configs:
       password: "${REGISTRY_DEPLOY_PASSWORD}"
     tls:
       insecure_skip_verify: false
+
+
+
+deploy-cluster:
+  stage: deploy
+  image: $ANSIBLE_IMAGE
+  when: manual
+  needs:
+    - job: download-artifacts
+      artifacts: true
+    - job: check-connectivity
+  before_script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$ANSIBLE_SSH_PRIVATE_KEY" ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    - |
+      cat > registries.yaml <<EOF
+      configs:
+        "${CI_REGISTRY}":
+          auth:
+            username: "${REGISTRY_DEPLOY_USERNAME}"
+            password: "${REGISTRY_DEPLOY_PASSWORD}"
+          tls:
+            insecure_skip_verify: false
+      EOF
+    - |
+      cat > deploy-vars.yml <<EOF
+      rke2_install_version: "${RKE2_VERSION}"
+      rke2_force_tarball_install: true
+      rke2_install_local_tarball_path: "${CI_PROJECT_DIR}/artifacts/rke2.linux-amd64"
+      rke2_registry_config_file_path: "${CI_PROJECT_DIR}/registries.yaml"
+      cluster_rke2_config:
+        system-default-registry: "${CI_REGISTRY}/platform/rke2-artefacts/rke2"
+      EOF
+    - ansible-playbook playbooks/site.yml -i inventory/cluster/ -b -e @deploy-vars.yml
+    - echo "✓ Cluster RKE2 déployé"
