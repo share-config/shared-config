@@ -1,0 +1,9 @@
+---
+# Variables spécifiques aux agents RKE2 (workers)
+# Fichier : inventory/cluster/group_vars/rke2_agents.yml
+
+# Configuration spécifique aux agents — à compléter si nécessaire
+# Exemple : labels ou taints sur les workers
+# group_rke2_config:
+#   node-label:
+#     - "node-role.kubernetes.io/worker=true"

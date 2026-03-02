@@ -1,0 +1,45 @@
+---
+# Bootstrap — Création d'un utilisateur sudoer sur les nœuds RKE2
+# Variables requises :
+#   deploy_user    : nom du nouvel utilisateur (ex: rke2)
+#   ssh_public_key : clé publique SSH à autoriser
+
+- name: Bootstrap sudoer user on RKE2 nodes
+  hosts: all
+  become: true
+
+  tasks:
+    - name: "Create user {{ deploy_user }}"
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        state: present
+        shell: /bin/bash
+        create_home: true
+      # Idempotent : pas d'erreur si l'utilisateur existe déjà
+
+    - name: "Grant passwordless sudo to {{ deploy_user }} via sudoers.d"
+      ansible.builtin.copy:
+        content: "{{ deploy_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        dest: "/etc/sudoers.d/{{ deploy_user }}"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "visudo -cf %s"
+      # Idempotent : skips si le fichier est déjà identique
+      # validate garantit que le fichier sudoers est syntaxiquement correct
+
+    - name: "Ensure ~/.ssh directory exists for {{ deploy_user }}"
+      ansible.builtin.file:
+        path: "/home/{{ deploy_user }}/.ssh"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0700"
+      # Idempotent : skips si le dossier existe déjà
+
+    - name: "Copy SSH public key to {{ deploy_user }} authorized_keys"
+      ansible.builtin.authorized_key:
+        user: "{{ deploy_user }}"
+        state: present
+        key: "{{ ssh_public_key }}"
+      # Idempotent : skips si la clé est déjà présente

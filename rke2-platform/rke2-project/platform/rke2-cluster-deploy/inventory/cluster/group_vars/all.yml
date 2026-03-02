@@ -1,0 +1,17 @@
+---
+# Variables globales du cluster RKE2
+# Fichier : inventory/cluster/group_vars/all.yml
+
+# Version RKE2 cible (surchargée par la variable CI RKE2_VERSION)
+rke2_install_version: "v1.32.1+rke2r1"
+
+# Forcer l'installation par tarball (mode air-gap)
+rke2_force_tarball_install: true
+
+# Chemin vers le binaire RKE2 (téléchargé depuis le Package Registry project1)
+# Ce chemin est injecté dynamiquement par le job deploy-cluster via deploy-vars.yml
+rke2_install_local_tarball_path: ""
+
+# Chemin vers le fichier registries.yaml (config containerd → GitLab Registry)
+# Ce chemin est injecté dynamiquement par le job deploy-cluster via deploy-vars.yml
+rke2_registry_config_file_path: ""

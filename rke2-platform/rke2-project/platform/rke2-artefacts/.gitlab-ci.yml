@@ -1,0 +1,139 @@
+# ─────────────────────────────────────────────────────────────
+# RKE2 Image Sync + Verify + Binaries Pipeline
+# Project : platform/rke2-artefacts
+# Trigger : Manuel uniquement (Run Pipeline depuis l'UI GitLab)
+# ─────────────────────────────────────────────────────────────
+
+variables:
+  RKE2_VERSION: "v1.32.1+rke2r1"   # Surchargeable au déclenchement
+  SKOPEO_IMAGE: "registry.gitlab.example.com/platform/tools/skopeo-custom:latest"
+  ARCH: "amd64"
+
+stages:
+  - sync
+  - verify
+
+# ──────────────────────────────
+# Stage sync — Pousser les images dans la registry
+# ──────────────────────────────
+sync-rke2-images:
+  stage: sync
+  image: $SKOPEO_IMAGE
+  when: manual
+  script:
+    - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - |
+      set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+
+      push_tarball() {
+        local ZST="$1"
+        local TAR="${ZST%.zst}"
+
+        echo ""
+        echo ">>> ${ZST}"
+        echo "[1/3] Téléchargement..."
+        wget -q --show-progress -O "${ZST}" "${BASE_URL}/${ZST}"
+
+        echo "[2/3] Décompression..."
+        zstd -d "${ZST}" -o "${TAR}" && rm -f "${ZST}"
+
+        echo "[3/3] Push des images..."
+        tar -xOf "${TAR}" manifest.json \
+          | jq -r '.[].RepoTags[] | select(. != null)' \
+          | while read -r IMAGE; do
+              TARGET="${CI_REGISTRY_IMAGE}/rke2/$(echo "$IMAGE" | sed 's|.*/||')"
+              echo "    ${IMAGE} -> ${TARGET}"
+              skopeo copy "docker-archive:${TAR}:${IMAGE}" "docker://${TARGET}"
+              echo "${TARGET}" >> pushed-images.txt
+            done
+
+        rm -f "${TAR}"
+      }
+
+      push_tarball "rke2-images-core.linux-${ARCH}.tar.zst"
+      push_tarball "rke2-images-calico.linux-${ARCH}.tar.zst"
+  artifacts:
+    paths:
+      - pushed-images.txt
+    expire_in: 1 day
+
+# ──────────────────────────────
+# Stage sync — Télécharger et stocker les binaires
+# ──────────────────────────────
+download-rke2-binaries:
+  stage: sync
+  image: $SKOPEO_IMAGE
+  when: manual
+  script:
+    - |
+      set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+      PKG_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/rke2/${RKE2_VERSION}"
+
+      echo ">>> Téléchargement des artefacts RKE2 ${RKE2_VERSION}"
+      wget -q --show-progress -O rke2.linux-amd64           "${BASE_URL}/rke2.linux-amd64"
+      wget -q --show-progress -O rke2-images.linux-amd64.tar.zst "${BASE_URL}/rke2-images.linux-${ARCH}.tar.zst"
+      wget -q --show-progress -O sha256sum-amd64.txt         "${BASE_URL}/sha256sum-amd64.txt"
+
+      echo ">>> Vérification SHA256..."
+      sha256sum -c sha256sum-amd64.txt --ignore-missing
+
+      echo ">>> Publication dans GitLab Package Registry..."
+      for FILE in rke2.linux-amd64 rke2-images.linux-amd64.tar.zst sha256sum-amd64.txt; do
+        echo "    Upload: ${FILE}"
+        wget --method=PUT \
+             --header="JOB-TOKEN: ${CI_JOB_TOKEN}" \
+             --body-file="${FILE}" \
+             "${PKG_URL}/${FILE}"
+      done
+
+      echo "✓ Binaires publiés dans le Package Registry"
+
+# ──────────────────────────────
+# Stage verify — Vérifier les images poussées
+# ──────────────────────────────
+verify-rke2-images:
+  stage: verify
+  image: $SKOPEO_IMAGE
+  when: manual
+  needs:
+    - job: sync-rke2-images
+      artifacts: true
+  script:
+    - skopeo login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - |
+      set -e
+      VERSION_URL=$(echo "$RKE2_VERSION" | sed 's/+/%2B/g')
+      BASE_URL="https://github.com/rancher/rke2/releases/download/${VERSION_URL}"
+
+      echo ">>> Téléchargement des listes officielles d'images..."
+      wget -q -O core.txt   "${BASE_URL}/rke2-images-core.linux-${ARCH}.txt"
+      wget -q -O calico.txt "${BASE_URL}/rke2-images-calico.linux-${ARCH}.txt"
+      cat core.txt calico.txt > expected.txt
+
+      EXPECTED=$(wc -l < expected.txt | tr -d ' ')
+      PUSHED=$(wc -l < pushed-images.txt | tr -d ' ')
+      echo "Images attendues : ${EXPECTED} | Images poussées : ${PUSHED}"
+
+      TOTAL=0
+      FAILED=0
+
+      while read -r SOURCE_IMAGE; do
+        SHORT=$(echo "$SOURCE_IMAGE" | sed 's|.*/||')
+        TARGET="${CI_REGISTRY_IMAGE}/rke2/${SHORT}"
+        TOTAL=$((TOTAL + 1))
+        DIGEST=$(skopeo inspect --format "{{.Digest}}" "docker://${TARGET}" 2>/dev/null || echo "")
+        if [ -n "$DIGEST" ]; then
+          echo "✓ ${SHORT} — ${DIGEST}"
+        else
+          echo "✗ ${SHORT} — MANQUANTE"
+          FAILED=$((FAILED + 1))
+        fi
+      done < expected.txt
+
+      echo ""
+      echo "Résumé : Attendues=${EXPECTED} | Vérifiées=$((TOTAL - FAILED)) | Manquantes=${FAILED}"
+      [ "$FAILED" -eq 0 ] || exit 1

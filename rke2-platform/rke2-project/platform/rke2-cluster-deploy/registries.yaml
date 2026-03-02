@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────
+# registries.yaml — Configuration containerd pour RKE2
+# Ce fichier est copié sur chaque nœud par le playbook Ansible
+# via la variable rke2_registry_config_file_path
+#
+# Remplacez :
+#   registry.gitlab.example.com  → votre domaine GitLab
+#   platform/rke2-artefacts      → votre groupe/projet
+#   PLACEHOLDER_USERNAME         → votre deploy token username
+#   PLACEHOLDER_PASSWORD         → votre deploy token password
+# ─────────────────────────────────────────────────────────────
+
+mirrors:
+  "docker.io":
+    endpoint:
+      - "https://registry.gitlab.example.com/platform/rke2-artefacts"
+  "registry.k8s.io":
+    endpoint:
+      - "https://registry.gitlab.example.com/platform/rke2-artefacts"
+  "quay.io":
+    endpoint:
+      - "https://registry.gitlab.example.com/platform/rke2-artefacts"
+
+configs:
+  "registry.gitlab.example.com":
+    auth:
+      username: "PLACEHOLDER_USERNAME"
+      password: "PLACEHOLDER_PASSWORD"
+    tls:
+      insecure_skip_verify: false

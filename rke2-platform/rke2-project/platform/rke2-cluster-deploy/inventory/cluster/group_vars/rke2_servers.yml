@@ -1,0 +1,9 @@
+---
+# Variables spécifiques aux serveurs RKE2 (control plane)
+# Fichier : inventory/cluster/group_vars/rke2_servers.yml
+
+# Configuration spécifique au(x) serveur(s) — à compléter si nécessaire
+# Exemple : désactiver le scheduler sur les nœuds server pour workloads
+# group_rke2_config:
+#   node-taint:
+#     - "CriticalAddonsOnly=true:NoExecute"
