@@ -49,7 +49,9 @@ download-helm:
 
 
 
-
+alpine/helm:4.1
+ubuntu:22.04
+nginx:1.29-perl
 
 
 
