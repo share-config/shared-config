@@ -253,3 +253,41 @@ deploy-argocd:
         --version "${ARGOCD_CHART_VERSION}"
         --namespace argocd
         --create-namespace
+
+
+
+
+# update-hosts.yml
+-# update-hosts.yml
+---
+- name: Add domains to /etc/hosts
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Inject domains block into /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED HOSTS"
+        block: "{{ lookup('file', hosts_file) }}"
+
+
+
+
+
+
+
+update-hosts:
+  stage: configure
+  image: cytopia/ansible:latest
+  before_script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "${ANSIBLE_SSH_PRIVATE_KEY}" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+  script:
+    # HOSTS_DOMAINS est un File var → contient le chemin du fichier
+    - ansible-playbook update-hosts.yml
+        -i inventory/
+        -e "hosts_file=${HOSTS_DOMAINS}"
+  rules:
+    - when: manual
