@@ -86,3 +86,93 @@ sync-rancher-images:
       [ "${ERRORS}" -eq 0 ] || exit 1
   rules:
     - when: manual
+
+
+
+
+
+
+
+
+
+
+
+deploy-rancher:
+  stage: platform
+  image: "${DEPLOY_IMAGE}"
+  variables:
+    RANCHER_VERSION: "2.10.3"
+    RANCHER_NAMESPACE: "cattle-system"
+    RANCHER_DOMAIN: "rancher.app.platform.local"
+    PLATFORM_SERVICES_PATH: "platform/rke2-platform-services"
+    HELM_CHANNEL: "stable"
+    REPLICAS: "3"
+    # Variables masquées GitLab (Settings → CI/CD → Variables) :
+    # CLUSTER_KUBECONFIG         (type: File)
+    # HELM_DEPLOY_TOKEN_USER     (masked)
+    # HELM_DEPLOY_TOKEN_PASSWORD (masked)
+    # REGISTRY_USER              (masked)
+    # REGISTRY_PASSWORD          (masked)
+    # TLS_CERT_FILE              (type: File)  ← wildcard *.app.platform.local
+    # TLS_KEY_FILE               (type: File)
+    # CA_CERT_FILE               (type: File)  ← CA racine (si privateCA=true)
+  script:
+    # ── Construire les URLs depuis le group path ──────────────────
+    - PLATFORM_PATH_ENC=$(echo "${PLATFORM_SERVICES_PATH}" | sed 's|/|%2F|g')
+    - HELM_REPO_URL="${CI_API_V4_URL}/projects/${PLATFORM_PATH_ENC}/packages/helm/${HELM_CHANNEL}"
+    - PLATFORM_REGISTRY="${CI_REGISTRY}/${PLATFORM_SERVICES_PATH}"
+    - export KUBECONFIG="${CLUSTER_KUBECONFIG}"
+
+    # ── 1. Helm repo ──────────────────────────────────────────────
+    - helm repo add rancher-local "${HELM_REPO_URL}" --username "${HELM_DEPLOY_TOKEN_USER}" --password "${HELM_DEPLOY_TOKEN_PASSWORD}"
+    - helm repo update rancher-local
+
+    # ── 2. Namespace ──────────────────────────────────────────────
+    - kubectl create namespace "${RANCHER_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 3. imagePullSecret ────────────────────────────────────────
+    - |
+      DOCKER_AUTH=$(echo -n "${REGISTRY_USER}:${REGISTRY_PASSWORD}" | base64 -w0)
+      kubectl create secret generic gitlab-registry-rancher \
+        --from-literal=.dockerconfigjson="{\"auths\":{\"${CI_REGISTRY}\":{\"username\":\"${REGISTRY_USER}\",\"password\":\"${REGISTRY_PASSWORD}\",\"auth\":\"${DOCKER_AUTH}\"}}}" \
+        --type=kubernetes.io/dockerconfigjson \
+        --namespace="${RANCHER_NAMESPACE}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 4. TLS secret (nom imposé par Rancher) ────────────────────
+    - |
+      kubectl create secret tls tls-rancher-ingress \
+        --cert="${TLS_CERT_FILE}" \
+        --key="${TLS_KEY_FILE}" \
+        --namespace="${RANCHER_NAMESPACE}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 5. CA secret (requis si privateCA=true) ───────────────────
+    - |
+      kubectl create secret generic tls-ca \
+        --from-file=cacerts.pem="${CA_CERT_FILE}" \
+        --namespace="${RANCHER_NAMESPACE}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 6. Helm upgrade --install ─────────────────────────────────
+    - |
+      helm upgrade --install rancher rancher-local/rancher \
+        --version "${RANCHER_VERSION}" \
+        --namespace "${RANCHER_NAMESPACE}" \
+        --wait --timeout 15m \
+        --set hostname="${RANCHER_DOMAIN}" \
+        --set replicas="${REPLICAS}" \
+        --set rancherImage="${PLATFORM_REGISTRY}/rancher/rancher" \
+        --set systemDefaultRegistry="${PLATFORM_REGISTRY}" \
+        --set useBundledSystemChart=true \
+        --set ingress.tls.source=secret \
+        --set privateCA=true \
+        --set ingress.ingressClassName=nginx \
+        --set imagePullSecrets[0].name=gitlab-registry-rancher
+
+    # ── 7. Vérification ───────────────────────────────────────────
+    - kubectl rollout status deployment/rancher -n "${RANCHER_NAMESPACE}" --timeout=10m
+    - echo "✓ Rancher ${RANCHER_VERSION} → https://${RANCHER_DOMAIN}"
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
