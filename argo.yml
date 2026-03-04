@@ -140,3 +140,39 @@ deploy-argocd:
                -o jsonpath="{.data.password}" | base64 -d)
       echo "✓ ArgoCD ${ARGOCD_VERSION} → https://${ARGOCD_DOMAIN}  admin / ${PASS}"
   when: manual
+
+
+
+
+
+fetch-kubeconfig:
+  stage: deploy
+  image: "${ANSIBLE_IMAGE}"
+  variables:
+    KUBECONFIG_PATH: "/etc/rancher/rke2/rke2.yaml"
+  script:
+    # ── Extraire le premier master depuis l'inventaire ────────────
+    - |
+      MASTER_IP=$(python3 -c "
+      import yaml
+      with open('inventory/hosts.yml') as f:
+          inv = yaml.safe_load(f)
+      hosts = inv['all']['children']['rke2_servers']['hosts']
+      print(list(hosts.values())[0]['ansible_host'])
+      ")
+      echo "MASTER_IP = ${MASTER_IP}"
+
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "${ANSIBLE_SSH_PRIVATE_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${MASTER_IP} \
+        "sudo cat ${KUBECONFIG_PATH}" \
+        | sed "s/127.0.0.1/${MASTER_IP}/g" \
+        > kubeconfig.yaml
+    - echo "✓ Kubeconfig extrait depuis ${MASTER_IP}"
+  artifacts:
+    paths:
+      - kubeconfig.yaml
+    expire_in: 1 hour
+  when: manual
