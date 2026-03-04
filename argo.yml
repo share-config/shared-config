@@ -291,3 +291,14 @@ update-hosts:
         -e "hosts_file=${HOSTS_DOMAINS}"
   rules:
     - when: manual
+
+
+
+
+
+      kubectl create secret docker-registry "${REGISTRY_SECRET_NAME}" \
+        --namespace "${ARGOCD_NAMESPACE}" \
+        --docker-server="${REGISTRY_SERVER}" \
+        --docker-username="${REGISTRY_USER}" \
+        --docker-password="${REGISTRY_PASSWORD}" \
+        --dry-run=client -o yaml | kubectl apply -f -
