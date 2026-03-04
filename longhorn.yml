@@ -1,0 +1,224 @@
+---
+- name: Longhorn — prérequis RHEL 9.7 (source doc officielle)
+  hosts: rke2_servers:rke2_agents
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ── 1. Paquets requis ──────────────────────────────────────────
+    # source : https://longhorn.io/docs/latest/deploy/install/
+    - name: Installer les paquets Longhorn (RHEL/CentOS)
+      ansible.builtin.shell: >
+        yum --setopt=tsflags=noscripts install -y
+        iscsi-initiator-utils
+        nfs-utils
+        cryptsetup
+        device-mapper
+      args:
+        executable: /bin/bash
+
+    # ── 2. iSCSI initiator name ────────────────────────────────────
+    # source : doc officielle RHEL/CentOS
+    - name: Générer le nom iSCSI initiator
+      ansible.builtin.shell: >
+        echo "InitiatorName=$(/sbin/iscsi-iname)"
+        > /etc/iscsi/initiatorname.iscsi
+      args:
+        creates: /etc/iscsi/initiatorname.iscsi
+
+    # ── 3. iscsid : activer UNIQUEMENT iscsid (pas iscsi.service) ──
+    # source KB : https://longhorn.io/kb/troubleshooting-open-iscsi-on-rhel/
+    # iscsi.service rallonge le boot de 2-3min si volumes attachés au reboot
+    - name: Désactiver iscsi.service (ralentit le boot avec volumes Longhorn)
+      ansible.builtin.systemd:
+        name: iscsi.service
+        enabled: false
+        state: stopped
+      ignore_errors: true
+
+    - name: Activer et démarrer iscsid
+      ansible.builtin.systemd:
+        name: iscsid
+        enabled: true
+        state: started
+
+    # ── 4. Module kernel iscsi_tcp ────────────────────────────────
+    # source : doc officielle
+    - name: Charger iscsi_tcp
+      community.general.modprobe:
+        name: iscsi_tcp
+        state: present
+
+    - name: Persister iscsi_tcp au démarrage
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/longhorn.conf
+        content: "iscsi_tcp\n"
+
+    # ── 5. multipathd — blacklist devices Longhorn ─────────────────
+    # source KB : https://longhorn.io/kb/troubleshooting-volume-with-multipath/
+    # Longhorn crée des devices /dev/sd[x] → multipath doit les ignorer
+    - name: Configurer /etc/multipath.conf (blacklist sd*)
+      ansible.builtin.copy:
+        dest: /etc/multipath.conf
+        content: |
+          defaults {
+              user_friendly_names yes
+          }
+          blacklist {
+              devnode "^sd[a-z0-9]+"
+          }
+      notify: Restart multipathd
+
+    - name: Activer et démarrer multipathd
+      ansible.builtin.systemd:
+        name: multipathd
+        enabled: true
+        state: started
+
+    # ── 6. SELinux — fix dac_override pour iscsid_t ────────────────
+    # source KB : https://longhorn.io/kb/troubleshooting-volume-attachment-fails-due-to-selinux-denials
+    # RHEL 9 + container-selinux > 2.189.0 → iscsiadm bloqué par SELinux
+    # Fix officiel : module CIL (pas setsebool)
+    - name: Créer module SELinux Longhorn (dac_override pour iscsid_t)
+      ansible.builtin.copy:
+        dest: /tmp/local_longhorn.cil
+        content: "(allow iscsid_t self (capability (dac_override)))\n"
+
+    - name: Appliquer le module SELinux
+      ansible.builtin.command: semodule -vi /tmp/local_longhorn.cil
+      register: semodule_result
+      changed_when: "'Committing changes' in semodule_result.stdout"
+
+    # ── 7. Vérifier NFSv4 (requis pour RWX et backup) ─────────────
+    # source : doc officielle
+    - name: Vérifier support NFSv4 dans le kernel
+      ansible.builtin.shell: |
+        cat /boot/config-$(uname -r) | grep CONFIG_NFS_V4
+      register: nfs_check
+      changed_when: false
+
+    - name: Afficher le support NFSv4
+      ansible.builtin.debug:
+        var: nfs_check.stdout_lines
+
+  handlers:
+    - name: Restart multipathd
+      ansible.builtin.systemd:
+        name: multipathd
+        state: restarted
+
+
+
+
+
+
+
+
+publish-longhorn-chart:
+  stage: publish
+  image: alpine/helm:latest
+  variables:
+    LONGHORN_CHART_VERSION: "1.7.2"      # ← contrôlé par CI variable
+    HELM_CHANNEL:           "stable"
+  before_script:
+    - apk add --no-cache curl ca-certificates
+    - cp "${GITLAB_CA_CERT_PATH}" /usr/local/share/ca-certificates/platform-ca.crt
+    - update-ca-certificates
+  script:
+    - helm repo add longhorn https://charts.longhorn.io
+    - helm repo update
+    - helm pull longhorn/longhorn --version "${LONGHORN_CHART_VERSION}"
+    - |
+      curl --fail-with-body \
+           --cacert "${GITLAB_CA_CERT_PATH}" \
+           --request POST \
+           --user "gitlab-ci-token:${CI_JOB_TOKEN}" \
+           --form "chart=@longhorn-${LONGHORN_CHART_VERSION}.tgz" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/${HELM_CHANNEL}/charts"
+    - echo "✓ chart longhorn:${LONGHORN_CHART_VERSION} → Helm Package Registry"
+  rules:
+    - when: manual
+
+
+
+
+
+
+
+
+
+
+
+
+
+sync-longhorn-images:
+  stage: sync
+  image: alpine/helm:latest
+  variables:
+    LONGHORN_CHART_VERSION: "1.7.2"
+    IMAGES_LIST_URL: "https://github.com/longhorn/longhorn/releases/download/v${LONGHORN_CHART_VERSION}/longhorn-images.txt"
+  before_script:
+    - apk add --no-cache skopeo curl ca-certificates
+    - cp "${GITLAB_CA_CERT_PATH}" /usr/local/share/ca-certificates/platform-ca.crt
+    - update-ca-certificates
+  script:
+    # ── 1. Télécharger la liste officielle des images ─────────────
+    - |
+      echo "=== Téléchargement longhorn-images.txt v${LONGHORN_CHART_VERSION} ==="
+      curl --fail --silent -L "${IMAGES_LIST_URL}" -o longhorn-images.txt
+      echo "Images à synchroniser :"
+      cat longhorn-images.txt
+      echo ""
+
+    # ── 2. Login registre GitLab local ───────────────────────────
+    - skopeo login "${CI_REGISTRY}" --username gitlab-ci-token --password "${CI_JOB_TOKEN}"
+
+    # ── 3. Copier chaque image docker.io → registre local ────────
+    - |
+      ERRORS=0
+      TOTAL=0
+      while IFS= read -r IMAGE || [ -n "${IMAGE}" ]; do
+        # Ignorer les lignes vides et commentaires
+        [ -z "${IMAGE}" ] || [ "${IMAGE#\#}" != "${IMAGE}" ] && continue
+
+        TOTAL=$((TOTAL + 1))
+        SRC="docker://${IMAGE}"
+        # Préserver le chemin complet : longhornio/xxx:tag → registry/.../longhornio/xxx:tag
+        DST="docker://${CI_REGISTRY_IMAGE}/${IMAGE}"
+
+        echo "▶  ${IMAGE}"
+        echo "   → ${CI_REGISTRY_IMAGE}/${IMAGE}"
+
+        if skopeo copy \
+            --override-os   linux \
+            --override-arch amd64 \
+            "${SRC}" "${DST}"; then
+          echo "   ✓ OK"
+        else
+          echo "   ✗ ERREUR"
+          ERRORS=$((ERRORS + 1))
+        fi
+        echo ""
+      done < longhorn-images.txt
+
+      echo "══════════════════════════════"
+      echo "  Total  : ${TOTAL}"
+      echo "  OK     : $((TOTAL - ERRORS))"
+      echo "  Erreurs: ${ERRORS}"
+      [ "${ERRORS}" -eq 0 ] || exit 1
+  artifacts:
+    paths:
+      - longhorn-images.txt
+    expire_in: 7 days
+  rules:
+    - when: manual
+
+
+
+
+
+
+
+
+
