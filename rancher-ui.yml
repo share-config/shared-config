@@ -1,0 +1,88 @@
+publish-rancher-chart:
+  stage: publish
+  image: "${DEPLOY_IMAGE}"
+  variables:
+    RANCHER_VERSION: "2.10.3"
+    HELM_CHANNEL: "stable"
+  script:
+    # 1. Repo officiel Rancher stable
+    - helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+    - helm repo update rancher-stable
+
+    # 2. Pull du chart (version = RANCHER_VERSION)
+    - helm pull rancher-stable/rancher --version "${RANCHER_VERSION}"
+
+    # 3. Push dans le GitLab Helm Package Registry
+    - |
+      curl --fail-with-body \
+           --request POST \
+           --user "gitlab-ci-token:${CI_JOB_TOKEN}" \
+           --form "chart=@rancher-${RANCHER_VERSION}.tgz" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/${HELM_CHANNEL}/charts"
+
+    - echo "✓ rancher-${RANCHER_VERSION}.tgz publié dans Helm Package Registry"
+  rules:
+    - when: manual
+
+
+
+
+
+
+sync-rancher-images:
+  stage: sync
+  image: "${DEPLOY_IMAGE}"
+  variables:
+    RANCHER_VERSION: "2.10.3"
+    RANCHER_IMAGES_URL: "https://github.com/rancher/rancher/releases/download/v${RANCHER_VERSION}/rancher-images.txt"
+  script:
+    # 1. Télécharger la liste officielle
+    - curl -fsSL "${RANCHER_IMAGES_URL}" -o rancher-images.txt
+    - echo "── $(wc -l < rancher-images.txt) images à synchroniser ──"
+
+    # 2. Login registry local
+    - skopeo login "${CI_REGISTRY}" --username gitlab-ci-token --password "${CI_JOB_TOKEN}"
+
+    # 3. Copier chaque image
+    - |
+      ERRORS=0
+      TOTAL=0
+
+      while IFS= read -r IMAGE || [ -n "$IMAGE" ]; do
+        # ignorer lignes vides et commentaires
+        [ -z "$IMAGE" ] && continue
+        echo "$IMAGE" | grep -q '^#' && continue
+
+        TOTAL=$((TOTAL + 1))
+
+        # Normaliser : ajouter docker.io/ si pas de registry explicite
+        # (rancher/rancher → docker.io/rancher/rancher)
+        # (docker.io/rancher/xxx → inchangé)
+        # (registry.k8s.io/xxx → inchangé)
+        case "$IMAGE" in
+          *.*/*) SRC="docker://${IMAGE}" ;;       # déjà un FQDN registry
+          *)     SRC="docker://docker.io/${IMAGE}" ;;  # registry implicite docker.io
+        esac
+
+        # Destination : conserver le chemin complet sous CI_REGISTRY_IMAGE
+        # docker.io/rancher/rancher:v2.10.3  → ${CI_REGISTRY_IMAGE}/rancher/rancher:v2.10.3
+        # registry.k8s.io/pause:3.9          → ${CI_REGISTRY_IMAGE}/registry.k8s.io/pause:3.9
+        REF="${IMAGE#docker.io/}"
+        DST="docker://${CI_REGISTRY_IMAGE}/${REF}"
+
+        echo "[${TOTAL}] ${IMAGE}"
+        if skopeo copy \
+            --override-os linux --override-arch amd64 \
+            "${SRC}" "${DST}"; then
+          echo "  ✓"
+        else
+          echo "  ✗ ERREUR"
+          ERRORS=$((ERRORS + 1))
+        fi
+      done < rancher-images.txt
+
+      echo "──────────────────────────────────────────"
+      echo "Total : ${TOTAL} | OK : $((TOTAL - ERRORS)) | Erreurs : ${ERRORS}"
+      [ "${ERRORS}" -eq 0 ] || exit 1
+  rules:
+    - when: manual
