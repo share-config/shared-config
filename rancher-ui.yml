@@ -28,64 +28,30 @@ publish-rancher-chart:
 
 
 
-
 sync-rancher-images:
   stage: sync
   image: "${DEPLOY_IMAGE}"
   variables:
-    RANCHER_VERSION: "2.10.3"
-    RANCHER_IMAGES_URL: "https://github.com/rancher/rancher/releases/download/v${RANCHER_VERSION}/rancher-images.txt"
+    RANCHER_VERSION: "v2.10.3"
+    BCI_MICRO_VERSION: "15.6.24.2"
+    SHELL_VERSION: "v0.3.1"
   script:
-    # 1. Télécharger la liste officielle
-    - curl -fsSL "${RANCHER_IMAGES_URL}" -o rancher-images.txt
-    - echo "── $(wc -l < rancher-images.txt) images à synchroniser ──"
-
-    # 2. Login registry local
     - skopeo login "${CI_REGISTRY}" --username gitlab-ci-token --password "${CI_JOB_TOKEN}"
-
-    # 3. Copier chaque image
     - |
-      ERRORS=0
-      TOTAL=0
+      copy_image() {
+        SRC="docker://docker.io/${1}"
+        DST="docker://${CI_REGISTRY_IMAGE}/${1}"
+        echo "→ ${1}"
+        skopeo copy --override-os linux --override-arch amd64 "${SRC}" "${DST}" \
+          && echo "  ✓" || { echo "  ✗"; exit 1; }
+      }
 
-      while IFS= read -r IMAGE || [ -n "$IMAGE" ]; do
-        # ignorer lignes vides et commentaires
-        [ -z "$IMAGE" ] && continue
-        echo "$IMAGE" | grep -q '^#' && continue
-
-        TOTAL=$((TOTAL + 1))
-
-        # Normaliser : ajouter docker.io/ si pas de registry explicite
-        # (rancher/rancher → docker.io/rancher/rancher)
-        # (docker.io/rancher/xxx → inchangé)
-        # (registry.k8s.io/xxx → inchangé)
-        case "$IMAGE" in
-          *.*/*) SRC="docker://${IMAGE}" ;;       # déjà un FQDN registry
-          *)     SRC="docker://docker.io/${IMAGE}" ;;  # registry implicite docker.io
-        esac
-
-        # Destination : conserver le chemin complet sous CI_REGISTRY_IMAGE
-        # docker.io/rancher/rancher:v2.10.3  → ${CI_REGISTRY_IMAGE}/rancher/rancher:v2.10.3
-        # registry.k8s.io/pause:3.9          → ${CI_REGISTRY_IMAGE}/registry.k8s.io/pause:3.9
-        REF="${IMAGE#docker.io/}"
-        DST="docker://${CI_REGISTRY_IMAGE}/${REF}"
-
-        echo "[${TOTAL}] ${IMAGE}"
-        if skopeo copy \
-            --override-os linux --override-arch amd64 \
-            "${SRC}" "${DST}"; then
-          echo "  ✓"
-        else
-          echo "  ✗ ERREUR"
-          ERRORS=$((ERRORS + 1))
-        fi
-      done < rancher-images.txt
-
-      echo "──────────────────────────────────────────"
-      echo "Total : ${TOTAL} | OK : $((TOTAL - ERRORS)) | Erreurs : ${ERRORS}"
-      [ "${ERRORS}" -eq 0 ] || exit 1
+      copy_image "rancher/rancher:${RANCHER_VERSION}"
+      copy_image "rancher/mirrored-bci-micro:${BCI_MICRO_VERSION}"
+      copy_image "rancher/shell:${SHELL_VERSION}"
   rules:
     - when: manual
+
 
 
 
