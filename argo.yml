@@ -176,3 +176,57 @@ fetch-kubeconfig:
       - kubeconfig.yaml
     expire_in: 1 hour
   when: manual
+
+
+variables:
+  ARGOCD_CHART_VERSION: "9.4.6"
+  HELM_CHANNEL:         "stable"
+  # ── Images versions ───────────────────────────────────────────
+  ARGOCD_VERSION:       "v2.14.9"
+  DEX_VERSION:          "v2.42.0"
+  REDIS_VERSION:        "7.4.2-alpine"
+
+stages:
+  - publish
+
+publish-argocd-helm-chart:
+  stage: publish
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache curl skopeo ca-certificates
+    # Installer la CA self-signed pour curl ET skopeo
+    - cp "${GITLAB_CA_CERT_PATH}" /usr/local/share/ca-certificates/gitlab-ca.crt
+    - update-ca-certificates
+  script:
+    # ── 1. Images : internet → registre GitLab local ─────────────
+    - skopeo login "${CI_REGISTRY}" --username gitlab-ci-token --password "${CI_JOB_TOKEN}"
+    - |
+      copy_image() {
+        local src="$1" dst="$2"
+        echo "▶  ${src}"
+        echo "   → ${dst}"
+        skopeo copy \
+          --override-os   linux \
+          --override-arch amd64 \
+          "docker://${src}" \
+          "docker://${dst}" \
+          && echo "   ✓ OK" || { echo "   ✗ ERREUR"; exit 1; }
+      }
+
+      copy_image "quay.io/argoproj/argocd:${ARGOCD_VERSION}"               "${CI_REGISTRY_IMAGE}/argocd:${ARGOCD_VERSION}"
+      copy_image "ghcr.io/dexidp/dex:${DEX_VERSION}"                       "${CI_REGISTRY_IMAGE}/dex:${DEX_VERSION}"
+      copy_image "public.ecr.aws/docker/library/redis:${REDIS_VERSION}"     "${CI_REGISTRY_IMAGE}/redis:${REDIS_VERSION}"
+
+    # ── 2. Chart Helm : upstream → Helm Package Registry GitLab ──
+    - helm repo add argo https://argoproj.github.io/argo-helm
+    - helm repo update
+    - helm pull argo/argo-cd --version "${ARGOCD_CHART_VERSION}"
+    - |
+      curl --fail-with-body \
+           --cacert "${GITLAB_CA_CERT_PATH}" \
+           --request POST \
+           --user "gitlab-ci-token:${CI_JOB_TOKEN}" \
+           --form "chart=@argo-cd-${ARGOCD_CHART_VERSION}.tgz" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/${HELM_CHANNEL}/charts"
+  rules:
+    - when: manual
