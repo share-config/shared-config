@@ -222,3 +222,72 @@ sync-longhorn-images:
 
 
 
+deploy-longhorn:
+  stage: platform
+  image: "${DEPLOY_IMAGE}"
+  variables:
+    LONGHORN_CHART_VERSION: "1.7.2"
+    LONGHORN_NAMESPACE: "longhorn-system"
+    LONGHORN_DOMAIN: "longhorn.app.platform.local"
+    TLS_SECRET_NAME: "wildcard-app-tls"
+    PLATFORM_SERVICES_PATH: "platform/rke2-platform-services"
+    HELM_CHANNEL: "stable"
+    # Variables masquées GitLab (Settings → CI/CD → Variables) :
+    # CLUSTER_KUBECONFIG       (type: File)
+    # HELM_DEPLOY_TOKEN_USER   (masked)
+    # HELM_DEPLOY_TOKEN_PASSWORD (masked)
+    # REGISTRY_USER            (masked)
+    # REGISTRY_PASSWORD        (masked)
+    # TLS_CERT_FILE            (type: File)
+    # TLS_KEY_FILE             (type: File)
+  script:
+    # ── Construire les URLs depuis le group path ──────────────────
+    - PLATFORM_PATH_ENC=$(echo "${PLATFORM_SERVICES_PATH}" | sed 's|/|%2F|g')
+    - HELM_REPO_URL="${CI_API_V4_URL}/projects/${PLATFORM_PATH_ENC}/packages/helm/${HELM_CHANNEL}"
+    - PLATFORM_REGISTRY="${CI_REGISTRY}/${PLATFORM_SERVICES_PATH}"
+    - export KUBECONFIG="${CLUSTER_KUBECONFIG}"
+
+    # ── 1. Helm repo (Helm Package Registry, deploy token statique)
+    - helm repo add longhorn-local "${HELM_REPO_URL}" --username "${HELM_DEPLOY_TOKEN_USER}" --password "${HELM_DEPLOY_TOKEN_PASSWORD}"
+    - helm repo update longhorn-local
+
+    # ── 2. Namespace ──────────────────────────────────────────────
+    - kubectl create namespace "${LONGHORN_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 3. imagePullSecret ────────────────────────────────────────
+    - |
+      DOCKER_AUTH=$(echo -n "${REGISTRY_USER}:${REGISTRY_PASSWORD}" | base64 -w0)
+      kubectl create secret generic gitlab-registry-longhorn \
+        --from-literal=.dockerconfigjson="{\"auths\":{\"${CI_REGISTRY}\":{\"username\":\"${REGISTRY_USER}\",\"password\":\"${REGISTRY_PASSWORD}\",\"auth\":\"${DOCKER_AUTH}\"}}}" \
+        --type=kubernetes.io/dockerconfigjson \
+        --namespace="${LONGHORN_NAMESPACE}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 4. TLS secret ─────────────────────────────────────────────
+    - |
+      kubectl create secret tls "${TLS_SECRET_NAME}" \
+        --cert="${TLS_CERT_FILE}" \
+        --key="${TLS_KEY_FILE}" \
+        --namespace="${LONGHORN_NAMESPACE}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # ── 5. Helm upgrade --install ─────────────────────────────────
+    - |
+      helm upgrade --install longhorn longhorn-local/longhorn \
+        --version "${LONGHORN_CHART_VERSION}" \
+        --namespace "${LONGHORN_NAMESPACE}" \
+        --wait --timeout 10m \
+        --set preUpgradeChecker.jobEnabled=false \
+        --set global.cattle.systemDefaultRegistry="${PLATFORM_REGISTRY}" \
+        --set imagePullSecrets[0].name=gitlab-registry-longhorn \
+        --set defaultSettings.defaultReplicaCount=3 \
+        --set ingress.enabled=true \
+        --set ingress.ingressClassName=nginx \
+        --set ingress.host="${LONGHORN_DOMAIN}" \
+        --set ingress.tls=true \
+        --set ingress.tlsCertificate.name="${TLS_SECRET_NAME}"
+
+    - echo "✓ Longhorn ${LONGHORN_CHART_VERSION} → https://${LONGHORN_DOMAIN}"
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
