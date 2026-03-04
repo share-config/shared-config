@@ -36,163 +36,107 @@ publish-argocd-helm-chart:
 
 
 
-alpine/helm:4.1
-ubuntu:22.04
-nginx:1.29-perl
+
+fetch-kubeconfig:
+  stage: deploy
+  image: "${ANSIBLE_IMAGE}"
+  script:
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "${ANSIBLE_SSH_PRIVATE_KEY}" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      # Extraire le kubeconfig et remplacer 127.0.0.1 par l'IP du master
+      ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${MASTER_IP} \
+        "sudo cat /etc/rancher/rke2/rke2.yaml" \
+        | sed "s/127.0.0.1/${MASTER_IP}/g" \
+        > kubeconfig.yaml
+    - echo "✓ Kubeconfig extrait → copier dans CI/CD variable CLUSTER_KUBECONFIG (type: File)"
+  artifacts:
+    paths:
+      - kubeconfig.yaml
+    expire_in: 1 hour
+  when: manual
 
 
 
+deploy-argocd:
+  stage: platform
+  image: "${DEPLOY_IMAGE}"
+  variables:
+    # ── Versions ──────────────────────────────────────────────────
+    ARGOCD_CHART_VERSION: "7.8.23"
+    ARGOCD_VERSION:       "v2.14.9"
+    DEX_VERSION:          "v2.42.0"
+    REDIS_VERSION:        "7.4.2-alpine"
+    # ── Déploiement ───────────────────────────────────────────────
+    ARGOCD_NAMESPACE:     "argocd"
+    ARGOCD_DOMAIN:        "argocd.app.platform.local"
+    TLS_SECRET_NAME:      "wildcard-app-tls"
+    # ── Registre source (rke2-platform-services) ──────────────────
+    PLATFORM_SERVICES_PATH: "platform/rke2-platform-services"
+    # ── CI File variables (GitLab Settings) ───────────────────────
+    # CLUSTER_KUBECONFIG → type File
+    # TLS_CERT_FILE      → type File (PEM cert *.app.platform.local)
+    # TLS_KEY_FILE       → type File (PEM key  *.app.platform.local)
+    # DEPLOY_IMAGE       → image avec kubectl + helm inclus
+  script:
+    - PLATFORM_REGISTRY="${CI_REGISTRY}/${PLATFORM_SERVICES_PATH}"
+    - export KUBECONFIG="${CLUSTER_KUBECONFIG}"
 
+    - helm registry login "${CI_REGISTRY}" --username gitlab-ci-token --password "${CI_JOB_TOKEN}"
 
----
-# Installe ArgoCD via Helm sur le premier nœud serveur RKE2
-# Prérequis : Helm déjà installé sur le master (job install-helm)
-# Chart      : fourni via oci://CI_REGISTRY_IMAGE/argo-cd (packagé par l'utilisateur)
+    - kubectl create namespace "${ARGOCD_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
-- name: Install ArgoCD via Helm
-  hosts: rke2_servers[0]
-  become: true
+    - |
+      kubectl create secret tls "${TLS_SECRET_NAME}" \
+        --cert="${TLS_CERT_FILE}" \
+        --key="${TLS_KEY_FILE}"   \
+        -n "${ARGOCD_NAMESPACE}"  \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-  vars:
-    kubeconfig: /etc/rancher/rke2/rke2.yaml
-    argocd_namespace: argocd
-    helm_tmp: /tmp/argocd-deploy
+    - |
+      cat > /tmp/argocd-values.yaml << EOF
+      global:
+        image:
+          repository: "${PLATFORM_REGISTRY}/argocd"
+          tag:        "${ARGOCD_VERSION}"
+      dex:
+        image:
+          repository: "${PLATFORM_REGISTRY}/dex"
+          tag:        "${DEX_VERSION}"
+      redis:
+        image:
+          repository: "${PLATFORM_REGISTRY}/redis"
+          tag:        "${REDIS_VERSION}"
+      server:
+        extraArgs: ["--insecure"]
+        ingress:
+          enabled:          true
+          ingressClassName: nginx
+          hostname:         "${ARGOCD_DOMAIN}"
+          tls:              true
+          extraTls:
+            - hosts:      ["${ARGOCD_DOMAIN}"]
+              secretName: "${TLS_SECRET_NAME}"
+      configs:
+        params:
+          server.insecure: "true"
+        cm:
+          url: "https://${ARGOCD_DOMAIN}"
+      EOF
 
-  tasks:
+    - |
+      helm upgrade --install argocd \
+        "oci://${PLATFORM_REGISTRY}/argo-cd" \
+        --version   "${ARGOCD_CHART_VERSION}" \
+        --namespace "${ARGOCD_NAMESPACE}"     \
+        --values    /tmp/argocd-values.yaml   \
+        --wait --timeout 10m
 
-    # ── Préparation ───────────────────────────────────────────────
-    - name: Create temp directory
-      ansible.builtin.file:
-        path: "{{ helm_tmp }}"
-        state: directory
-        mode: "0700"
-
-    - name: Copy static values.yaml to node
-      ansible.builtin.copy:
-        src: "{{ values_file }}"
-        dest: "{{ helm_tmp }}/values.yaml"
-        mode: "0600"
-
-    - name: Generate values-images.yaml (image overrides)
-      ansible.builtin.copy:
-        dest: "{{ helm_tmp }}/values-images.yaml"
-        mode: "0600"
-        content: |
-          global:
-            image:
-              repository: "{{ ci_registry_image }}/argoproj/argocd"
-              tag: "{{ argocd_version }}"
-
-          dex:
-            image:
-              repository: "{{ ci_registry_image }}/dex-idp/dex"
-              tag: "{{ dex_version }}"
-
-          redis:
-            image:
-              repository: "{{ ci_registry_image }}/library/redis"
-              tag: "{{ redis_version }}"
-
-          redisSecretInit:
-            image:
-              repository: "{{ ci_registry_image }}/library/redis"
-              tag: "{{ redis_version }}"
-
-    # ── Login registre OCI ─────────────────────────────────────────
-    - name: Login to GitLab Helm OCI registry
-      ansible.builtin.command: >
-        helm registry login {{ ci_registry }}
-        --username {{ registry_username }}
-        --password {{ registry_password }}
-      environment:
-        HELM_CACHE_HOME: /tmp/helm-cache
-      no_log: true
-      changed_when: true
-
-    # ── Namespace + TLS secret ─────────────────────────────────────
-    - name: Create argocd namespace
-      ansible.builtin.shell: |
-        kubectl create namespace {{ argocd_namespace }} \
-          --dry-run=client -o yaml | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-
-    - name: Copy TLS cert to node
-      ansible.builtin.copy:
-        src: "{{ tls_cert_file }}"
-        dest: "{{ helm_tmp }}/tls.crt"
-        mode: "0600"
-
-    - name: Copy TLS key to node
-      ansible.builtin.copy:
-        src: "{{ tls_key_file }}"
-        dest: "{{ helm_tmp }}/tls.key"
-        mode: "0600"
-
-    - name: Create wildcard TLS secret in argocd namespace
-      ansible.builtin.shell: |
-        kubectl create secret tls wildcard-tls-secret \
-          --cert={{ helm_tmp }}/tls.crt \
-          --key={{ helm_tmp }}/tls.key \
-          --namespace {{ argocd_namespace }} \
-          --dry-run=client -o yaml | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-
-    # ── Helm install ───────────────────────────────────────────────
-    - name: Install or upgrade ArgoCD
-      ansible.builtin.command: >
-        helm upgrade --install argocd
-        oci://{{ ci_registry_image }}/argo-cd
-        --version {{ argocd_chart_version }}
-        --namespace {{ argocd_namespace }}
-        --values {{ helm_tmp }}/values.yaml
-        --values {{ helm_tmp }}/values-images.yaml
-        --wait
-        --timeout 10m
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-        HELM_CACHE_HOME: /tmp/helm-cache
-      register: helm_result
-
-    - name: Show Helm output
-      ansible.builtin.debug:
-        msg: "{{ helm_result.stdout_lines }}"
-
-    # ── Vérification ───────────────────────────────────────────────
-    - name: Verify ArgoCD pods
-      ansible.builtin.command: >
-        kubectl get pods -n {{ argocd_namespace }}
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      changed_when: false
-      register: pods
-
-    - name: Retrieve initial admin password
-      ansible.builtin.command: >
-        kubectl -n {{ argocd_namespace }}
-        get secret argocd-initial-admin-secret
-        -o jsonpath="{.data.password}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig }}"
-      register: argocd_pwd
-      changed_when: false
-
-    - name: Show ArgoCD access info
-      ansible.builtin.debug:
-        msg:
-          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - "✓  ArgoCD {{ argocd_version }} installé"
-          - "   URL      : https://argocd.app-dev.example.com"
-          - "   Login    : admin"
-          - "   Password : {{ argocd_pwd.stdout | b64decode }}"
-          - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          - "{{ pods.stdout_lines | join('\n') }}"
-
-    # ── Nettoyage ──────────────────────────────────────────────────
-    - name: Cleanup temp files
-      ansible.builtin.file:
-        path: "{{ helm_tmp }}"
-        state: absent
+    - kubectl rollout status deployment/argocd-server -n "${ARGOCD_NAMESPACE}" --timeout=5m
+    - |
+      PASS=$(kubectl get secret argocd-initial-admin-secret \
+               -n "${ARGOCD_NAMESPACE}" \
+               -o jsonpath="{.data.password}" | base64 -d)
+      echo "✓ ArgoCD ${ARGOCD_VERSION} → https://${ARGOCD_DOMAIN}  admin / ${PASS}"
+  when: manual
