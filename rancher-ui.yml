@@ -142,3 +142,137 @@ deploy-rancher:
   when: manual
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+
+
+
+
+    # ── 6. Pull chart, patch kubeVersion, helm upgrade --install ──
+    - |
+      echo "==> Pull du chart rancher ${RANCHER_VERSION}"
+      helm pull rancher-local/rancher \
+        --version "${RANCHER_VERSION}" \
+        --untar \
+        --untardir /tmp/rancher-chart
+
+      echo "==> Patch kubeVersion dans Chart.yaml"
+      # Remplace la restriction kubeVersion pour accepter 1.35.x
+      sed -i 's/kubeVersion:.*/kubeVersion: ">=1.25.0-0"/' \
+        /tmp/rancher-chart/rancher/Chart.yaml
+
+      echo "==> kubeVersion patché :"
+      grep kubeVersion /tmp/rancher-chart/rancher/Chart.yaml
+
+      echo "==> Déploiement Helm"
+      helm upgrade --install rancher /tmp/rancher-chart/rancher \
+        --version "${RANCHER_VERSION}" \
+        --namespace "${RANCHER_NAMESPACE}" \
+        --wait --timeout 15m \
+        --set hostname="${RANCHER_DOMAIN}" \
+        --set replicas="${REPLICAS}" \
+        --set rancherImage="${PLATFORM_REGISTRY}/rancher/rancher" \
+        --set systemDefaultRegistry="${PLATFORM_REGISTRY}" \
+        --set useBundledSystemChart=true \
+        --set ingress.tls.source=secret \
+        --set privateCA=true \
+        --set ingress.ingressClassName=nginx \
+        --set imagePullSecrets[0].name=gitlab-registry-rancher
+
+
+
+
+
+
+mirror-rancher-core-images:
+  stage: mirror-images
+  image: "${SKOPEO_IMAGE}"
+  timeout: 90 minutes
+  variables:
+    TARGET_REGISTRY: "${GITLAB_REGISTRY}/rancher"
+    RANCHER_VERSION:  "v2.13.3"
+  before_script:
+    - skopeo login "${CI_REGISTRY}"
+        --username "${REGISTRY_USER}"
+        --password "${REGISTRY_PASSWORD}"
+  script:
+    - |
+      # ══════════════════════════════════════════════════════
+      # Liste complète des images Rancher v2.13.3
+      # Source : Dockerfile officiel + setting.go + Helm chart
+      # ══════════════════════════════════════════════════════
+      IMAGES=(
+
+        # ── CORE ─────────────────────────────────────────────
+        "rancher/rancher:v2.13.3"
+        "rancher/rancher-agent:v2.13.3"
+
+        # ── WEBHOOK (manquait) ────────────────────────────────
+        # Extrait de : CATTLE_RANCHER_WEBHOOK_VERSION dans Dockerfile
+        "rancher/rancher-webhook:v0.9.3"
+
+        # ── AUDIT LOG SIDECAR ─────────────────────────────────
+        "rancher/mirrored-bci-micro:15.4.14.3"
+
+        # ── SHELL (kubectl/helm dans l'UI) ────────────────────
+        "rancher/shell:v0.2.2"
+
+        # ── MACHINE PROVISIONING ──────────────────────────────
+        "rancher/machine:v0.15.0-rancher137"
+
+        # ── SYSTEM AGENT ──────────────────────────────────────
+        "rancher/system-agent:v0.3.14-suc"
+        "rancher/system-agent-installer-rke2:v1.34.4-rke2r1"
+        "rancher/system-agent-installer-rke2:v1.33.8-rke2r1"
+        "rancher/system-agent-installer-rke2:v1.32.12-rke2r1"
+        "rancher/system-agent-installer-k3s:v1.34.1-k3s1"
+
+        # ── SYSTEM UPGRADE CONTROLLER (manquait) ──────────────
+        # Chart version 108.0.0 → image v0.15.2
+        "rancher/system-upgrade-controller:v0.15.2"
+
+        # ── FLEET (GitOps) ────────────────────────────────────
+        "rancher/fleet:v0.12.3"
+        "rancher/fleet-agent:v0.12.3"
+
+        # ── WINS AGENT (Windows nodes) ────────────────────────
+        "rancher/wins:v0.5.3-r2"
+      )
+
+      # ── Copie skopeo vers GitLab Registry ─────────────────
+      FAILED=()
+      for image in "${IMAGES[@]}"; do
+        NAME=$(echo "$image" | cut -d: -f1)
+        TAG=$(echo "$image"  | cut -d: -f2)
+        SRC="docker://docker.io/${image}"
+        DST="docker://${TARGET_REGISTRY}/${NAME}:${TAG}"
+
+        echo ""
+        echo "==> [COPY] ${image}"
+        echo "    SRC : ${SRC}"
+        echo "    DST : ${DST}"
+
+        if skopeo copy --retry-times 3 "${SRC}" "${DST}"; then
+          echo "    ✅ OK"
+        else
+          echo "    ❌ ÉCHEC"
+          FAILED+=("${image}")
+        fi
+      done
+
+      # ── Rapport final ──────────────────────────────────────
+      echo ""
+      echo "══════════════════════════════════════"
+      echo "  RÉSUMÉ : ${#IMAGES[@]} images traitées"
+      if [ ${#FAILED[@]} -gt 0 ]; then
+        echo "  ❌ ÉCHECS (${#FAILED[@]}) :"
+        for f in "${FAILED[@]}"; do echo "    - $f"; done
+        exit 1
+      else
+        echo "  ✅ Toutes les images copiées avec succès"
+      fi
+      echo "══════════════════════════════════════"
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  tags:
+    - docker
